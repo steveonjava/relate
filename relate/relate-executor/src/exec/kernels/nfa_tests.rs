@@ -483,15 +483,22 @@ fn declines_subpath_variable() {
     );
 }
 
-/// An empty type list (the any-type `[]` hop) declines: the union
-/// would have to be every interned type, which the caller cannot
-/// enumerate through the static list the IR carries.
+/// An empty type list (the untyped `[]` hop) compiles to the any-type
+/// transition: the empty id list is the untyped filter
+/// (`RelTypes::from_interned`), not a decline.
 #[test]
-fn declines_empty_type_list() {
-    declines(
+fn compiles_the_untyped_hop_as_the_any_type_set() {
+    let (_, nfa) = compiled(
         "MATCH p = (x:Person)-[*1..]-(y) RETURN p LIMIT 100",
         &["knows"],
     );
+    assert_eq!(nfa.transitions.len(), 1);
+    assert!(nfa.transitions[0].types.is_empty());
+    let (_, nfa) = compiled(
+        "MATCH p = (x:Person)-[*1..3]->(y) RETURN p LIMIT 100",
+        &["knows"],
+    );
+    assert!(nfa.transitions.iter().all(|t| t.types.is_empty()));
 }
 
 /// The wider out-of-vocabulary declines, one shape each.

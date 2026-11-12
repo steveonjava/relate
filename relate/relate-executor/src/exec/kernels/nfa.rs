@@ -51,7 +51,7 @@
 //! Every decline is structural, never an assert: state count above the
 //! 64-state bitmask ceiling (the prototype's `assert!` is a decline
 //! here), selectors, subpath variables, predicates on inner rels,
-//! non-static or empty type lists, a type name the store never interned,
+//! non-static type lists, a type name the store never interned,
 //! and anything that breaks the node/hop alternation. The two admission
 //! declines are switch-gated (ADR-0519): under `auto` an interior or
 //! inner node carrying admission facts declines exactly as before (the
@@ -359,9 +359,10 @@ pub(crate) fn compile(
     })
 }
 
-/// The plain one-hop rel of the vocabulary: a static non-empty type
-/// disjunction (the `(A|B)` union is one type list, not alternation IR),
-/// no predicates, exactly one hop. Direction and the variable name ride
+/// The plain one-hop rel of the vocabulary: a static type disjunction
+/// (the `(A|B)` union is one type list, not alternation IR; the empty
+/// list is the untyped hop, which compiles to the any-type filter,
+/// `RelTypes::from_interned`'s empty-list coercion), no predicates, exactly one hop. Direction and the variable name ride
 /// the transition and the row binding — neither is constrained here.
 fn plain_rel(rel: &RelPattern) -> Option<()> {
     if rel.var_length
@@ -369,7 +370,6 @@ fn plain_rel(rel: &RelPattern) -> Option<()> {
         || rel.max_hops != Some(1)
         || rel.properties.is_some()
         || rel.where_clause.is_some()
-        || rel.types.is_empty()
         // The synthesized `type_expr` of every typed rel: static
         // disjunctions are exactly what the `types` list already carries
         // (single label or `Or`-chain of labels); anything dynamic,

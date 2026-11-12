@@ -18,10 +18,10 @@ use relate_core::Value;
 use crate::ctx::ExecCtx;
 use crate::exec::test_support::{
     build, complete_graph, decide, declines_with, exec_cypher, file_triangle, int_cell,
-    leading_match, line_graph, planned_clauses, profiled, reset_frontier_facts, same_rows, served,
-    Built, LeadingMatch,
+    leading_match, line_graph, planned_clauses, reset_frontier_facts, same_rows, Built,
+    LeadingMatch,
 };
-use crate::frontier_decline::{FrontierDecline, FrontierDeclineReason};
+use crate::frontier_decline::FrontierDecline;
 use crate::graph::Graph;
 use crate::overlay::ExecGraph;
 use crate::pattern_engine::PatternEngine;
@@ -401,16 +401,22 @@ const ENGAGING: &[&str] = &[
      ORDER BY b.id SKIP 1",
     // An aggregate over the endpoint set from an anchored seed.
     "MATCH (a {id: 0})-[:T*0..{k}]-(b) WHERE b <> a RETURN count(DISTINCT b) AS c",
+    // The untyped hop: the any-type set, undirected and directed, with a
+    // bare target (the sqlite-gate's k-hop reach shape).
+    "MATCH (a:File)-[*1..{k}]-(b) WHERE a <> b WITH DISTINCT a, b RETURN count(*) AS pairs",
+    "MATCH (a:File)-[*1..{k}]->(b:File) WHERE a <> b \
+     WITH DISTINCT a, b RETURN count(*) AS pairs",
+    "MATCH (a:File)<-[*2..{k1}]-(b) WHERE b <> a RETURN DISTINCT a.id AS a, b.id AS b",
+    // An untyped context hop around a typed quantifier.
+    "MATCH (a:File)-[]-(m)-[:T*1..{k}]-(b:File) WHERE a <> b \
+     WITH DISTINCT a, b RETURN count(*) AS pairs",
 ];
 
-/// The shapes outside the engine's reach (the untyped hop declines the
-/// NFA compile, the path-multiset consumers decline the answer shape):
-/// the answers are the walker's under every routing, and the rung never
-/// engages.
-const DECLINING: &[&str] = &[
-    "MATCH (a:File)-[*1..{k}]-(b) WHERE a <> b WITH DISTINCT a, b RETURN count(*) AS pairs",
-    "MATCH (a:File)-[:T*1..{k}]-(b:File) WHERE a <> b RETURN count(*) AS paths",
-];
+/// The shapes outside the engine's reach (the path-multiset consumers
+/// decline the answer shape): the answers are the walker's under every
+/// routing, and the rung never engages.
+const DECLINING: &[&str] =
+    &["MATCH (a:File)-[:T*1..{k}]-(b:File) WHERE a <> b RETURN count(*) AS paths"];
 
 proptest! {
     #![proptest_config(config_with_floor(192))]
@@ -466,9 +472,8 @@ fn gate_graph(nodes: usize) -> Built {
 
 /// The sqlite-gate's own statement shapes: co-change at `d = 1..4`
 /// (`*1..2d`) answers the walker under every routing, riding the forced
-/// rung; the k-hop reach shape (an untyped hop, LABS-1434's ticket) stays
-/// on the walker with the same answer, and its decline names the NFA
-/// compile.
+/// rung, and so does the k-hop reach shape (an untyped hop, compiled as
+/// the any-type set).
 #[test]
 fn the_gate_statements_answer_as_the_walker() {
     let mut built = gate_graph(36);
@@ -492,15 +497,9 @@ fn the_gate_statements_answer_as_the_walker() {
         );
         let (engaged, levels, _) = agree(&mut built.graph, &cypher);
         assert_eq!(
-            (engaged, levels),
-            (0, 0),
-            "k={k}: the untyped hop stays on the walker"
-        );
-        let records = profiled(&built.graph, &cypher);
-        assert_eq!(
-            served(&records).frontier_decline,
-            Some(FrontierDeclineReason::Plan(FrontierDecline::NfaShape)),
-            "k={k}: the decline names the NFA compile"
+            (engaged, levels > 0),
+            (1, true),
+            "k={k}: the untyped hop rides the forced rung"
         );
     }
 }

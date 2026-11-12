@@ -70,6 +70,9 @@ mod rearival_tests;
 // The frontier family's plan-time matcher arm (ADR-0478 §2): the
 // structural and answer-shape proofs plus the cost gate, compiled by the
 // rider wiring (`frontier_run`).
+pub(crate) mod frontier_cost;
+#[cfg(test)]
+mod frontier_cost_tests;
 pub(crate) mod frontier_match;
 #[cfg(test)]
 mod frontier_match_tests;
