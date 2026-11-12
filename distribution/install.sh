@@ -59,9 +59,26 @@ version_gt() {
 	}'
 }
 
+# Piped (`curl ... | bash`), this script runs before anyone has read it, and
+# the shell's own name stands in $0 instead of a script path. Say so once,
+# with where the inspect-then-run steps live; a run from a file stays quiet.
+case "$0" in
+*.sh) ;;
+*) echo "install.sh: running from a pipe, so this installer ran before you could read it; to review it first, see https://github.com/relatedb/relate#install" >&2 ;;
+esac
+
+# Windows installs through the PowerShell installer (ADR-0586): one install
+# location and one PATH update for every Windows shell, including the
+# POSIX-style ones (Git Bash, MSYS2, Cygwin) this script would otherwise run
+# under. Nothing is downloaded on that arm; the pointer names the command.
+WINDOWS_INSTALL_ONE_LINER='powershell -ExecutionPolicy ByPass -c "irm https://relatedb.ai/install.ps1 | iex"'
+
 case "$(uname -s)" in
 Darwin) os=darwin ;;
 Linux) os=linux ;;
+MINGW* | MSYS* | CYGWIN*)
+	die "on Windows (Git Bash, MSYS2 or Cygwin), install with the PowerShell installer instead: $WINDOWS_INSTALL_ONE_LINER"
+	;;
 *)
 	die "unsupported OS: $(uname -s). Supported: Darwin, Linux."
 	;;
@@ -87,9 +104,10 @@ trap 'rm -rf "$tmp"; [ -z "$tmp_out" ] || rm -f "$tmp_out"' EXIT
 
 # curl|sh: no script path on disk, so all state lives in $tmp.
 #
-# The one download transport (ADR-0585): every asset — the manifest, its
-# signature, the binary — comes from the direct browser download route the
-# public repository serves unauthenticated. No GitHub API request is made
+# The one transport (ADR-0585): every request — the releases.json document
+# and the three assets (the manifest, its signature, the binary), which come
+# from the direct browser download route the public repository serves
+# unauthenticated — goes through fetch_url. No GitHub API request is made
 # anywhere in this script: anonymous API requests are limited to 60/hour per
 # IP, and shared egress addresses (VPNs, corporate NAT, Cloudflare WARP)
 # routinely exhaust that quota — the failure that broke the one-liner while
@@ -99,15 +117,35 @@ trap 'rm -rf "$tmp"; [ -z "$tmp_out" ] || rm -f "$tmp_out"' EXIT
 # requests are TLS-only twice over (CWE-295): the curl protocol pins keep
 # every hop — the initial request and each redirect to the asset CDN — on
 # https, and no Authorization header is sent (no token is read, and curl
-# would forward a custom header across a cross-host redirect).
-direct_get() { # $1 = asset name, $2 = destination
-	url="$download_base/$tag/$1"
+# would forward a custom header across a cross-host redirect). On failure it
+# returns non-zero with the authored cause in $fetch_error, and each caller
+# dies with its own sentence around that cause.
+fetch_url() { # $1 = URL, $2 = destination
+	fetch_error=""
 	status=$(curl --proto '=https' --proto-redir '=https' -sSL \
-		-o "$2" -w '%{http_code}' "$url") ||
-		die "failed to fetch $url; check the connection and retry"
+		-o "$2" -w '%{http_code}' "$1") || {
+		fetch_error="failed to fetch $1; check the connection and retry"
+		return 1
+	}
 	case "$status" in
-	2??) ;;
-	*) die "GET $url: http status: $status" ;;
+	2??) return 0 ;;
+	*)
+		fetch_error="GET $1: http status: $status"
+		return 1
+		;;
+	esac
+}
+
+# One release asset over the direct route.
+direct_get() { # $1 = asset name, $2 = destination
+	fetch_url "$download_base/$tag/$1" "$2" || die "$fetch_error"
+}
+
+# The one https:// gate both override seams take, before any request.
+require_https() { # $1 = seam name, $2 = value
+	case "$2" in
+	https://*) ;;
+	*) die "$1 must be an https:// URL (got: $2)" ;;
 	esac
 }
 
@@ -181,20 +219,21 @@ metadata_url=${RELATE_RELEASES_JSON_URL:-$RELEASES_JSON_URL}
 # narrowing is a decision recorded in ADR-0585, not an accident. A
 # mis-set override dies here, before any network hop.
 download_base=${RELATE_RELEASE_DOWNLOAD_URL:-$DOWNLOAD_BASE}
-case "$download_base" in
-https://*) ;;
-*) die "RELATE_RELEASE_DOWNLOAD_URL must be an https:// URL (got: $download_base)" ;;
-esac
+require_https RELATE_RELEASE_DOWNLOAD_URL "$download_base"
+# The metadata seam takes the same gate (ADR-0586): releases.json selects
+# the release and is never trusted, but a plaintext fetch would still let an
+# on-path attacker steer which signed release installs, so it is TLS-only
+# too, through the one transport like every asset.
+require_https RELATE_RELEASES_JSON_URL "$metadata_url"
 metadata_fail="could not read the release list from $metadata_url"
-releases_doc=$(curl -fsSL "$metadata_url" || true)
-[ -n "$releases_doc" ] ||
-	die "$metadata_fail: the fetch failed"
+fetch_url "$metadata_url" "$tmp/releases.json" ||
+	die "$metadata_fail: the fetch failed: $fetch_error"
 
 # latest_tag_of owns the outcomes (its comment above): $tag is assigned
 # only the validated vX.Y.Z spelling, and each failure status maps to
 # its authored message here.
 latest_status=0
-latest_tag=$(printf '%s\n' "$releases_doc" | latest_tag_of) ||
+latest_tag=$(latest_tag_of <"$tmp/releases.json") ||
 	latest_status=$?
 case "$latest_status" in
 0) tag=$latest_tag ;;

@@ -1,11 +1,17 @@
 //! Agent catalog and path expansion, ported from neo4j-cli's
 //! `common/skill/agents.go`. The catalog lists the skill-capable AI agents
 // (their detect directory and skills directory). Path expansion mirrors the
-// Go `expandPath`: `~` and `~/foo` resolve via $HOME; `$XDG_CONFIG_HOME/...`
-// resolves via that env var or $HOME/.config when unset/empty; other paths
-// pass through unchanged.
+// Go `expandPath`: `~` and `~/foo` resolve via the home directory (`$HOME`,
+// else `%USERPROFILE%` — the shared rule in `crate::home_dir`, so stock
+// PowerShell and cmd on Windows, which set no `$HOME`, resolve too);
+// `$XDG_CONFIG_HOME/...` resolves via that env var when absolute, else
+// `<home>/.config` (the shared rule again); other paths pass through unchanged. Every catalog entry is
+// home-relative on Windows as well (each agent keeps its dot-directory under
+// the user profile there), so the catalog carries no per-OS rows.
 
 use std::path::PathBuf;
+
+use crate::home_dir::{home_dir_with, xdg_config_base_with};
 
 /// Describes a supported AI agent: where its install marker lives
 /// (`detect_dir`) and where its skill bundles go (`skills_dir`).
@@ -134,42 +140,42 @@ pub fn agent_names() -> Vec<&'static str> {
 
 const TOKEN_XDG_CONFIG_HOME: &str = "$XDG_CONFIG_HOME";
 
-/// Resolves a path containing `~` or `$XDG_CONFIG_HOME`.
+/// Resolves a path containing `~` or `$XDG_CONFIG_HOME` against the real
+/// environment; see [`expand_path_with`].
+fn expand_path(path: &str) -> Option<PathBuf> {
+    expand_path_with(path, &|k| std::env::var(k).ok())
+}
+
+/// Resolves a path containing `~` or `$XDG_CONFIG_HOME`, reading the
+/// environment through `env`:
 ///
-/// - `~` alone -> $HOME
-/// - `~/foo`   -> $HOME/foo
-/// - `$XDG_CONFIG_HOME/...` -> that env var, or $HOME/.config when unset/empty
+/// - `~` alone -> the home directory (`$HOME`, else `%USERPROFILE%`)
+/// - `~/foo`   -> `<home>/foo`
+/// - `$XDG_CONFIG_HOME/...` -> that env var when absolute, else
+///   `<home>/.config` (unset, empty or relative)
 /// - other paths are returned unchanged
 ///
-/// Returns `None` only when the base the path needs can't be resolved
-/// (e.g. $HOME empty).
-fn expand_path(path: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_default();
-
+/// The `/`-separated tail is joined component by component, so a Windows
+/// path comes out with native separators. Returns `None` only when the
+/// base the path needs can't be resolved (no home directory).
+fn expand_path_with(path: &str, env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
     if path == "~" {
-        if home.is_empty() {
-            return None;
-        }
-        return Some(PathBuf::from(home));
+        return home_dir_with(env);
     }
     if let Some(rest) = path.strip_prefix("~/") {
-        if home.is_empty() {
-            return None;
-        }
-        return Some(PathBuf::from(home).join(rest));
+        return home_dir_with(env).map(|home| join_tail(home, rest));
     }
-    if path.contains(TOKEN_XDG_CONFIG_HOME) {
-        let xdg = std::env::var("XDG_CONFIG_HOME").unwrap_or_default();
-        let base = if !xdg.is_empty() {
-            xdg
-        } else if !home.is_empty() {
-            format!("{home}/.config")
-        } else {
-            return None;
-        };
-        return Some(PathBuf::from(path.replace(TOKEN_XDG_CONFIG_HOME, &base)));
+    if let Some(rest) = path.strip_prefix(TOKEN_XDG_CONFIG_HOME) {
+        return xdg_config_base_with(env).map(|base| join_tail(base, rest));
     }
     Some(PathBuf::from(path))
+}
+
+/// `base` joined with each non-empty `/`-separated component of `tail`.
+fn join_tail(base: PathBuf, tail: &str) -> PathBuf {
+    tail.split('/')
+        .filter(|component| !component.is_empty())
+        .fold(base, |path, component| path.join(component))
 }
 
 #[cfg(test)]
@@ -277,10 +283,11 @@ mod tests {
     fn home_unset_returns_empty_detect_agents() {
         with_env_lock(|| {
             std::env::remove_var("HOME");
+            std::env::remove_var("USERPROFILE");
             std::env::remove_var("XDG_CONFIG_HOME");
             let detected = detect_agents();
-            // opencode uses $XDG_CONFIG_HOME which falls back to $HOME/.config,
-            // but HOME is unset so that's None too -> empty.
+            // opencode uses $XDG_CONFIG_HOME which falls back to <home>/.config,
+            // but neither HOME nor USERPROFILE is set so that's None too -> empty.
             assert!(
                 detected.is_empty(),
                 "expected empty with HOME unset, got {:?}",
@@ -355,11 +362,63 @@ mod tests {
 
     #[test]
     fn expand_path_home_empty_returns_none_for_tilde() {
-        with_env_lock(|| {
-            std::env::remove_var("HOME");
-            assert_eq!(expand_path("~"), None);
-            assert_eq!(expand_path("~/foo"), None);
-        });
+        let env = crate::telemetry::env_of(&[]);
+        assert_eq!(expand_path_with("~", &env), None);
+        assert_eq!(expand_path_with("~/foo", &env), None);
+        assert_eq!(expand_path_with("$XDG_CONFIG_HOME/opencode", &env), None);
+    }
+
+    #[test]
+    fn expand_path_falls_back_to_userprofile_without_home() {
+        // Stock PowerShell and cmd on Windows set USERPROFILE but no HOME:
+        // every catalog path must still resolve under the profile.
+        let profile_str = crate::home_dir::host_absolute("Users/u");
+        let profile = PathBuf::from(&profile_str);
+        let pairs = [("USERPROFILE", profile_str.as_str())];
+        let env = crate::telemetry::env_of(&pairs);
+        assert_eq!(expand_path_with("~", &env), Some(profile.clone()));
+        assert_eq!(
+            expand_path_with("~/.claude/skills", &env),
+            Some(profile.join(".claude").join("skills"))
+        );
+        assert_eq!(
+            expand_path_with("$XDG_CONFIG_HOME/opencode/skills", &env),
+            Some(profile.join(".config").join("opencode").join("skills"))
+        );
+        for agent in AGENTS {
+            let skills = expand_path_with(agent.skills_dir, &env)
+                .unwrap_or_else(|| panic!("{} skills dir must resolve", agent.name));
+            assert!(
+                skills.starts_with(&profile),
+                "{} resolves outside the profile: {}",
+                agent.name,
+                skills.display()
+            );
+        }
+    }
+
+    #[test]
+    fn expand_path_prefers_home_over_userprofile() {
+        let profile = crate::home_dir::host_absolute("Users/u");
+        let pairs = [("HOME", "/home/u"), ("USERPROFILE", profile.as_str())];
+        let env = crate::telemetry::env_of(&pairs);
+        assert_eq!(
+            expand_path_with("~/.claude", &env),
+            Some(PathBuf::from("/home/u").join(".claude"))
+        );
+    }
+
+    #[test]
+    fn expand_path_xdg_overrides_the_home_fallback() {
+        // Absolute on the host: a relative XDG value never names a base, so
+        // a bare "/xdg" would fall back to HOME on Windows.
+        let xdg = crate::home_dir::host_absolute("xdg");
+        let pairs = [("XDG_CONFIG_HOME", xdg.as_str()), ("HOME", "/home/u")];
+        let env = crate::telemetry::env_of(&pairs);
+        assert_eq!(
+            expand_path_with("$XDG_CONFIG_HOME/opencode", &env),
+            Some(PathBuf::from(&xdg).join("opencode"))
+        );
     }
 
     #[test]

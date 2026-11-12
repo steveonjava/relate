@@ -142,6 +142,48 @@ installer_download_env=$(sed -n 's/^download_base=${\([A-Z_]*\):-\$DOWNLOAD_BASE
 assert_same "drift guard: install.sh's override env var matches download_route.rs (ADR-0585)" \
 	"$rust_download_env" "$installer_download_env"
 
+# The PowerShell installer (ADR-0586) carries its own copy of every
+# constant above; its behavior is exercised by
+# scripts/tests/test_install_ps1.ps1 on the Windows lane, and its copies are
+# held to install.sh's and the CLI's here, on every host, so a rotation or a
+# URL move cannot leave the Windows installer behind.
+PS_INSTALLER="$ROOT/distribution/install.ps1"
+ps_literal() { # $1 = variable name, without the leading $
+	sed -n "s/^\\\$$1 = '\\(.*\\)'\$/\\1/p" "$PS_INSTALLER"
+}
+assert_same "drift guard: install.ps1's pinned signing key matches distribution/release-signing-key.pub" \
+	"$(ps_literal RelateSigningKey)" "$pub_key"
+assert_same "drift guard: install.ps1's sums header prefix matches manifest.rs (ADR-0457)" \
+	"$(ps_literal RelateSumsVersionPrefix)" "$rust_prefix"
+assert_same "drift guard: install.ps1's legacy ceiling matches manifest.rs (ADR-0457)" \
+	"$(ps_literal RelateLegacyManifestCeiling)" "$rust_ceiling"
+assert_same "drift guard: install.ps1's releases.json URL matches releases_json.rs (ADR-0571)" \
+	"$(ps_literal RelateReleasesJsonUrl)" "$rust_releases_url"
+assert_same "drift guard: install.ps1's download base matches install.sh's (ADR-0585)" \
+	"$(ps_literal RelateDownloadBase)" "$installer_download_base"
+grep -qF "Get-RelateHttpsSeam -Name '$rust_releases_env'" "$PS_INSTALLER" &&
+	grep -qF "Get-RelateHttpsSeam -Name '$rust_download_env'" "$PS_INSTALLER"
+tap_check "drift guard: install.ps1 reads the two override seams install.sh and the CLI read, through its https gate" $?
+! grep -qE 'api\.github\.com|/releases/(tags|assets|latest)' "$PS_INSTALLER"
+tap_check "drift guard: install.ps1 consults no GitHub API endpoint (ADR-0585)" $?
+# Windows PowerShell 5.1 decodes a BOM-less script as ANSI (`irm | iex`
+# and `-File` alike), so a UTF-8 multi-byte character turns into other
+# characters, a smart quote among them, which PowerShell treats as a string
+# delimiter. The installer stays pure ASCII.
+! LC_ALL=C grep -q "$(printf '[\200-\377]')" "$PS_INSTALLER"
+tap_check "drift guard: install.ps1 is pure ASCII (Windows PowerShell 5.1 reads it as ANSI)" $?
+
+# The Windows one-liner is spelled in three places — install.sh's pointer
+# for Git Bash/MSYS/Cygwin, the CLI's Windows upgrade refusal, and
+# install.ps1's own header — and must be one string.
+installer_windows_one_liner=$(installer_literal WINDOWS_INSTALL_ONE_LINER)
+rust_windows_one_liner=$(sed -n '/^const WINDOWS_INSTALL_ONE_LINER: &str =$/{n;s/^ *"\(.*\)";$/\1/p;}' \
+	"$ROOT/surfaces/relate-cli/src/upgrade_cmd/mod.rs" | sed 's/\\"/"/g')
+assert_same "drift guard: the Windows install one-liner is one string in install.sh and upgrade_cmd (ADR-0586)" \
+	"$installer_windows_one_liner" "$rust_windows_one_liner"
+grep -qF "#   $installer_windows_one_liner" "$PS_INSTALLER"
+tap_check "drift guard: install.ps1's header documents the same one-liner" $?
+
 # The legacy-tag fixture (built below) derives from the ceiling the guard
 # just extracted, so a constant change cannot leave the fixture on a stale
 # hardcoded tag.
@@ -199,6 +241,22 @@ tap_check "unsupported OS (FreeBSD): installer dies non-zero" $?
 grep -q "unsupported OS" "$RUN_ERR"
 tap_check "unsupported OS (FreeBSD): error mentions unsupported OS" $?
 
+# Windows' POSIX-style shells get the PowerShell installer's one-liner
+# (ADR-0586) instead of `unsupported OS`, and nothing is downloaded.
+for windows_uname in MINGW64_NT-10.0-22631 MSYS_NT-10.0-19045 CYGWIN_NT-10.0-26100; do
+	reset_case
+	STUB_UNAME_S=$windows_uname
+	install_run "osarch-$windows_uname"
+	[ "$RUN_STATUS" -ne 0 ]
+	tap_check "Windows shell ($windows_uname): installer dies non-zero" $?
+	grep -qF "$installer_windows_one_liner" "$RUN_ERR"
+	tap_check "Windows shell ($windows_uname): error names the install.ps1 one-liner" $?
+	! grep -q "unsupported OS" "$RUN_ERR"
+	tap_check "Windows shell ($windows_uname): not reported as an unsupported OS" $?
+	[ ! -s "$RUN_LOG" ]
+	tap_check "Windows shell ($windows_uname): no request is made" $?
+done
+
 reset_case
 STUB_UNAME_M=i386
 install_run osarch-i386
@@ -206,6 +264,20 @@ install_run osarch-i386
 tap_check "unsupported arch (i386): installer dies non-zero" $?
 grep -q "unsupported architecture" "$RUN_ERR"
 tap_check "unsupported arch (i386): error mentions unsupported architecture" $?
+
+# Piped execution says so once, on stderr, and still installs; a run from a
+# file stays quiet.
+reset_case
+RUN_VIA_PIPE=1
+install_run piped
+[ "$RUN_STATUS" -eq 0 ]
+tap_check "piped run: installer exits 0" $?
+grep -qF "running from a pipe" "$RUN_ERR"
+tap_check "piped run: says it ran before it could be read, and where to review it" $?
+reset_case
+install_run from-file
+! grep -qF "running from a pipe" "$RUN_ERR"
+tap_check "run from a file: no piped-execution note" $?
 
 # --- 2. The direct route and GITHUB_TOKEN --------------------------------------
 #
@@ -386,6 +458,25 @@ grep -qF "https://example.test/releases.json" "$RUN_LOG"
 tap_check "metadata URL override: the override URL is fetched" $?
 ! grep -qF "$installer_releases_url" "$RUN_LOG"
 tap_check "metadata URL override: the canonical URL is not fetched" $?
+
+# The metadata seam is TLS-only like the download base (ADR-0586): a
+# plaintext override dies before any request, and the canonical fetch is
+# protocol-pinned across redirects.
+reset_case
+RELATE_RELEASES_JSON_URL=http://example.test/releases.json
+install_run releases-url-override-http
+[ "$RUN_STATUS" -ne 0 ]
+tap_check "metadata URL override, plain http: installer dies non-zero" $?
+grep -qF "RELATE_RELEASES_JSON_URL must be an https:// URL" "$RUN_ERR"
+tap_check "metadata URL override, plain http: error names the https:// requirement" $?
+[ ! -s "$RUN_LOG" ]
+tap_check "metadata URL override, plain http: no request is made" $?
+
+reset_case
+install_run releases-fetch-pinned
+awk '/^=CALL=$/ { call = "" ; next } { call = call $0 "\n" } /releases\.json$/ { print call; exit }' "$RUN_LOG" |
+	grep -qF -- "--proto-redir"
+tap_check "metadata fetch: protocol-pinned to https across redirects" $?
 
 reset_case
 RELATE_RELEASES_JSON_URL=

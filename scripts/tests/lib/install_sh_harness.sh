@@ -383,14 +383,24 @@ reset_case() {
 	STUB_FIXTURES_DIR=$fixtures
 	RUN_PATH="$stubbin:/usr/bin:/bin"
 	RUN_INSTALLER=$INSTALLER
+	RUN_VIA_PIPE=
 }
 
 # Run the installer fully sandboxed. Populates RUN_STATUS, RUN_HOME, RUN_LOG
 # (stub curl argv log) and RUN_ERR (installer stderr). RUN_INSTALLER selects
 # the script under test: the shipped install.sh everywhere except the
 # real-roundtrip cases, which run a sed-patched copy (see section 3c).
+# RUN_VIA_PIPE=1 feeds the script on stdin, as `curl ... | sh` does, instead
+# of naming it as a file.
 install_run() { # $1 = case name
 	case_name=$1
+	if [ -n "${RUN_VIA_PIPE:-}" ]; then
+		run_stdin=$RUN_INSTALLER
+		set -- /bin/sh
+	else
+		run_stdin=/dev/null
+		set -- /bin/sh "$RUN_INSTALLER"
+	fi
 	RUN_HOME="$sandbox/home-$case_name"
 	RUN_LOG="$sandbox/curl-$case_name.log"
 	RUN_KEYGEN_LOG="$sandbox/keygen-$case_name.log"
@@ -411,7 +421,7 @@ install_run() { # $1 = case name
 		${GITHUB_TOKEN:+GITHUB_TOKEN="$GITHUB_TOKEN"} \
 		${RELATE_RELEASES_JSON_URL+RELATE_RELEASES_JSON_URL="$RELATE_RELEASES_JSON_URL"} \
 		${RELATE_RELEASE_DOWNLOAD_URL+RELATE_RELEASE_DOWNLOAD_URL="$RELATE_RELEASE_DOWNLOAD_URL"} \
-		/bin/sh "$RUN_INSTALLER" >"$sandbox/out-$case_name.log" 2>"$RUN_ERR"
+		"$@" <"$run_stdin" >"$sandbox/out-$case_name.log" 2>"$RUN_ERR"
 	RUN_STATUS=$?
 }
 
