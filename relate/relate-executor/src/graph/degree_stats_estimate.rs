@@ -19,7 +19,7 @@ use relate_core::{NodeId, RelId};
 
 use super::count_state::CountDelta;
 use super::degree_stats_incident::IncidentRel;
-use super::{FreshIds, Graph};
+use super::{fill_labels, FreshIds, Graph};
 use crate::redo::RedoOp;
 
 impl Graph {
@@ -595,20 +595,17 @@ impl BatchSim {
             })
     }
 
-    /// The batch's label-set simulation's fill: cache the node's labels
-    /// once (the batch's simulated set, or the live set), then borrow —
-    /// no per-lookup clone of the live set on the admission path (the
-    /// cache-fill-and-borrow pattern). The fill returns
-    /// the entry's set so every site — the AddLabels step included —
-    /// borrows through the one fill shape.
+    /// The batch's label-set simulation's fill, through the one cache-fill
+    /// shape ([`fill_labels`]): the node's labels cached once (the batch's
+    /// simulated set, or the live set), then borrowed — the mutable half
+    /// of the pattern, which is why it is the shared fill and not
+    /// [`LabelCache`]'s read-only view.
     fn ensure_labels<'m>(
         node_labels: &'m mut HashMap<NodeId, Vec<u32>>,
         g: &Graph,
         id: NodeId,
     ) -> &'m mut Vec<u32> {
-        node_labels
-            .entry(id)
-            .or_insert_with(|| g.live_label_ids(id))
+        fill_labels(node_labels, g, id)
     }
 }
 
