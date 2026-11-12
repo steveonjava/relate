@@ -101,6 +101,56 @@ pub fn is_database_admin_command(plan: &LogicalPlan) -> bool {
             .all(|clause| admin_command_clause(clause).is_some())
 }
 
+/// ADR-0590: the command spelling for a plan that *composes* `SHOW
+/// DATABASES` with other clauses, or `None` when every occurrence stands in
+/// the canonical shape (the command alone, or with a trailing `RETURN` over
+/// its yielded columns, as the statement's whole body). Off the `system`
+/// namespace such a plan is CE's 51N28 `NotSystemDatabaseError`; on `system`
+/// the command is where it belongs and §4's clause whitelist governs
+/// instead.
+///
+/// `SHOW DATABASES` is the whole subject: the other §2 command, `ALTER
+/// DATABASE`, cannot be composed at all — the front end rejects every
+/// composed form of it (`WITH … ALTER …` and `MATCH … ALTER …` as an
+/// invalid composition, the trailing-`RETURN`/`NEXT` forms as 51N27), and
+/// live's grammar does not parse them either. The spelling returned is the
+/// parser's own keyword for the clause, the one table of clause names.
+///
+/// Part-granular over each part's TOP-LEVEL clauses, the granularity the §4
+/// whitelist and the `NEXT` backstop already use. A part's command is
+/// composed when anything substantive precedes it (a leading routing `USE`
+/// run is not composition), when its part is not the statement's only one (a
+/// `UNION` arm is never the standalone shape), when a `NEXT` stage follows,
+/// or when a clause other than a trailing `RETURN` follows it. Live
+/// 2026.10.1 raises the same rejection for the head and the mid-body
+/// position alike.
+pub fn composed_show_databases(plan: &LogicalPlan) -> Option<&'static str> {
+    let standalone = plan.parts.len() == 1 && plan.next.is_none();
+    for part in plan.parts() {
+        let body: Vec<&Clause> = part
+            .iter()
+            .skip_while(|clause| crate::clause_kind::clause_is_routing(clause))
+            .collect();
+        let Some(index) = body.iter().position(|clause| is_show_databases(clause)) else {
+            continue;
+        };
+        let composed = !standalone
+            || index != 0
+            || body[index + 1..]
+                .iter()
+                .any(|clause| !matches!(clause, Clause::Return { .. }));
+        if composed {
+            return Some(ir_clause_keyword(body[index]));
+        }
+    }
+    None
+}
+
+/// The one `SHOW DATABASES` test the §2 classifiers share.
+fn is_show_databases(clause: &Clause) -> bool {
+    admin_command_clause(clause) == Some(DatabaseAdminCommand::ShowDatabases)
+}
+
 /// ADR-0116 §2 / CIP-213 NE1.4: whether the plan combines `SHOW DATABASES`
 /// with a `NEXT` stage. The front-end's NEXT-chain validation rejects the
 /// combination before planning; this classifier is the execution-phase
@@ -110,26 +160,21 @@ pub fn is_database_admin_command(plan: &LogicalPlan) -> bool {
 /// a `SHOW DATABASES` nested in an expression subquery does not participate
 /// in a `NEXT` chain.
 pub fn is_show_databases_with_next(plan: &LogicalPlan) -> bool {
-    plan.next.is_some()
-        && plan.parts().any(|part| {
-            part.iter().any(|clause| {
-                admin_command_clause(clause) == Some(DatabaseAdminCommand::ShowDatabases)
-            })
-        })
+    plan.next.is_some() && plan.parts().any(|part| part.iter().any(is_show_databases))
 }
 
 /// ADR-0116 §2, amended 2026-11-04: whether the statement's body is
 /// *headed* by a database-administration command — the first top-level
 /// clause after any leading `USE` clauses is one of the §2 commands. This
-/// is the head shape CE's front end guards with the 42N79 auto-routing
-/// rejection; an administration command later in the body (after e.g. a
-/// `MATCH`) is a plain catalog read, not an administration-command
-/// statement — live CE 2026.09 runs `USE neo4j MATCH (n) SHOW DATABASES
-/// YIELD name RETURN name`, while every headed spelling under a
-/// non-system `USE` (bare, `YIELD … RETURN …`, `UNION` arm, `ALTER
-/// DATABASE`) is 42N79. Part-granular on the head part only: a command
-/// headed in a `NEXT` stage is already refused by the NEXT-chain rule
-/// ([`is_show_databases_with_next`]), and `USE` clauses never split parts.
+/// is the shape the 42N79 auto-routing gate is scoped to: every headed
+/// spelling under a non-system `USE` (bare, `YIELD … RETURN …`, `UNION`
+/// arm, `ALTER DATABASE`) is 42N79. A command later in the body (after
+/// e.g. a `MATCH`, or behind a leading `WITH`) is not headed, so that gate
+/// passes it through to the namespace gates — where, off `system`, it is
+/// the composed-form rejection instead (ADR-0590). Part-granular on the
+/// head part only: a command headed in a `NEXT` stage is already refused
+/// by the NEXT-chain rule ([`is_show_databases_with_next`]), and `USE`
+/// clauses never split parts.
 pub fn admin_command_heads_statement(plan: &LogicalPlan) -> bool {
     plan.parts.first().is_some_and(|head| {
         head.iter()
@@ -410,6 +455,49 @@ mod tests {
     }
 
     #[test]
+    fn composed_show_databases_follows_ce() {
+        // The canonical shapes: the command alone, with a trailing RETURN
+        // over its own yielded columns, and under a leading routing `USE`
+        // run — which routes the statement but is not composition.
+        for cypher in [
+            "SHOW DATABASES",
+            "SHOW DATABASES YIELD name RETURN name",
+            "USE neo4j SHOW DATABASES",
+            "USE system SHOW DATABASES YIELD name RETURN name",
+            // The other §2 command cannot be composed at all (the front end
+            // rejects every composed form), so it never classifies here.
+            "ALTER DATABASE neo4j SET DEFAULT LANGUAGE CYPHER 25",
+            "MATCH (n) RETURN n",
+        ] {
+            assert_eq!(composed_show_databases(&plan_of(cypher)), None, "{cypher}");
+        }
+        // Composed: an intervening clause after the YIELD, a clause before
+        // the command, another catalog command ahead of it (the harness's
+        // `SHOW FUNCTIONS … SHOW DATABASES …` scenario), a UNION arm, and a
+        // NEXT stage — live 2026.10.1 rejects each with the command named.
+        for cypher in [
+            "SHOW DATABASES YIELD name WITH 1 AS n RETURN n",
+            "SHOW DATABASES YIELD name MATCH (n) RETURN n",
+            "MATCH (n) SHOW DATABASES YIELD name RETURN name",
+            "SHOW FUNCTIONS YIELD name AS function SHOW DATABASES YIELD name AS database RETURN *",
+            "UNWIND ['a'] AS name RETURN name AS x \
+             UNION SHOW DATABASES YIELD name RETURN name AS x",
+        ] {
+            assert_eq!(
+                composed_show_databases(&plan_of(cypher)),
+                Some("SHOW DATABASES"),
+                "{cypher}"
+            );
+        }
+        // The `NEXT` condition is defensive — the front-end NEXT-chain rule
+        // rejects that combination before planning — so it is pinned on a
+        // spliced plan, the way the sibling `NEXT` classifier's test does.
+        let mut chained = plan_of("RETURN 1 AS x NEXT RETURN x");
+        chained.parts[0] = vec![show_databases_clause()];
+        assert_eq!(composed_show_databases(&chained), Some("SHOW DATABASES"));
+    }
+
+    #[test]
     fn show_databases_with_next_classifies_the_chain() {
         // The command in the head stage.
         let mut head = plan_of("RETURN 1 AS x NEXT RETURN x");
@@ -543,12 +631,12 @@ mod tests {
         }
         for cypher in [
             "MATCH (n) RETURN n",
-            // An administration command later in the body is a catalog
-            // read, not a headed command statement (live CE runs this).
+            // A command later in the body is not headed: the 42N79 gate
+            // passes it to the namespace gates, where off-system it is the
+            // composed-form rejection (ADR-0590, live 2026.10.1).
             "USE neo4j MATCH (n) SHOW DATABASES YIELD name RETURN name",
-            // A leading WITH heads the body instead (live CE: 51N28, not
-            // 42N79 — the off-system composed-form boundary this engine
-            // deliberately does not implement).
+            // A leading WITH heads the body instead — same outcome, the
+            // other rule.
             "USE neo4j WITH 1 AS n SHOW DATABASES YIELD name RETURN name",
             "SHOW INDEXES",
         ] {

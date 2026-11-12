@@ -47,6 +47,11 @@ pub const WITH_ON_SYSTEM_SUFFIX: &str =
 pub const USE_WITH_ADMIN_SUFFIX: &str =
     "The `USE` clause is not required for administration commands. \
      Retry your query without the `USE` clause, and it will be routed automatically.";
+/// CE's off-system 51N28 text, live-verified 2026-10 (ADR-0590;
+/// Neo.ClientError.Statement.NotSystemDatabaseError). The refused command
+/// is appended by the caller.
+pub const NEEDS_SYSTEM_DATABASE_SUFFIX: &str =
+    "This is an administration command and it should be executed against the system database: ";
 
 pub fn err_text<T>(result: relate::Result<T>) -> String {
     // `err().expect` over `unwrap_err`: no `T: Debug` bound, so callers
