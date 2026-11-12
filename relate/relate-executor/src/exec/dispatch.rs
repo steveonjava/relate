@@ -31,6 +31,7 @@ use super::clause_arms::{
 use super::count_stats::count_only_stats_result;
 use super::ddl::{exec_create_index, exec_drop_index};
 use super::foreach::exec_foreach;
+use super::label_set_groups::label_set_groups_result;
 use super::match_chain::{open_match_consumer, Landing, MatchConsumer};
 use super::match_clause::{
     charge_finished_container, run_match_operator_ladder, LadderFacts, LadderRun, MatchOperator,
@@ -160,6 +161,12 @@ fn run_clauses_mode(
         // NEXT/WHEN/ELSE body) must answer N × population, so the
         // recognizer declines on anything but that one row.
         if let Some((rows, result)) = count_only_stats_result(graph, clauses, &rows) {
+            return Ok((rows, Some(result)));
+        }
+        // ADR-0589: the grouped label aggregates answer from the
+        // maintained label-set counts under the same exactness window.
+        let ctx = ExecCtx::new(graph, params, qctx.cypher_version);
+        if let Some((rows, result)) = label_set_groups_result(ctx, clauses, &rows, scope)? {
             return Ok((rows, Some(result)));
         }
     }
