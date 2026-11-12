@@ -77,11 +77,13 @@ jobs:
   version:
     name: Bump version
     needs: release-owner
-    # macOS (ADR-0433 §6): this job also builds the Swift XCFramework and
-    # stamps its checksum into Package.swift, so the one release commit the
-    # `tag` job tags pins exactly the zip attached to the release.
-    # scripts/release-bump.sh is BSD-sed safe.
-    runs-on: macos-latest
+    # ADR-0572: this job pushes the bump commit and builds nothing — the
+    # release cut lands minutes after dispatch instead of after the
+    # five-target XCFramework build. The XCFramework builds in the
+    # xcframework matrix and the stamp job pushes the second release
+    # commit (the tag target). scripts/release-bump.sh runs on GNU sed,
+    # its designed CI platform.
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     outputs:
@@ -116,6 +118,12 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
 
+      # Keep @rev in sync with rust-toolchain.toml (channel = "1.88.0"):
+      # release-bump.sh runs `cargo metadata` while refreshing Cargo.lock,
+      # and the pinned toolchain keeps that off the runner's preinstalled
+      # cargo.
+      - uses: dtolnay/rust-toolchain@1.88.0
+
       # Self-contained step: the script self-checks consistency and restores
       # the files on failure, so a failed bump means no commit ever happens.
       - name: Bump version surfaces
@@ -123,47 +131,178 @@ jobs:
           NEXT_VERSION: ${{ steps.version.outputs.version }}
         run: scripts/release-bump.sh
 
-      # Keep @rev in sync with rust-toolchain.toml (channel = "1.88.0").
-      - uses: dtolnay/rust-toolchain@1.88.0
-        with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
-
-      # Build, stamp, commit, push — under a fetch + rebase + rebuild retry:
-      # a merge landing on main during the XCFramework build rejects the push
-      # as non-fast-forward (observed on the v0.1.1 run). The retry rebases
-      # and REBUILDS: ADR-0433 §6's contract is that the tagged commit's
-      # Package.swift checksum pins a zip built from that exact tree, so a
-      # rebase that changes the tree must re-stamp a fresh zip, not reuse a
-      # pre-rebase one. A rebase conflict fails loudly (nothing to merge
-      # automatically; the release stays untagged).
-      - name: Build, stamp, commit and push the version bump
+      # Commit and push — under a fetch + rebase retry. A rebase here is
+      # safe because nothing has been built yet (ADR-0572: this push is
+      # the release cut; every artifact job builds from a commit that
+      # descends from it). A rebase conflict fails loudly (the release
+      # stays untagged).
+      - name: Commit and push the version bump
         id: commit
         run: |
           set -euo pipefail
           git config user.name "release-bot"
           git config user.email "actions@github.com"
+          # scripts/release-bump.sh is the single source of truth for
+          # which files a bump touches; stage whatever it modified so a
+          # new version surface can never be left out of the commit.
+          git add -u
+          # The bump script is idempotent: a re-dispatch after a
+          # fail-before-tag finds the bump commit already on main
+          # (empty diff); skip the commit but still emit HEAD.
+          if git diff --cached --quiet; then
+            echo "No version changes to commit; reusing HEAD."
+          else
+            git commit -m "chore(release): ${{ steps.version.outputs.tag }}"
+          fi
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              break
+            fi
+            if [ "$attempt" = 3 ]; then
+              echo "::error::push to main rejected after 3 attempts"
+              exit 1
+            fi
+            echo "push to main rejected (attempt $attempt) — rebasing onto origin/main"
+            git fetch origin main
+            git rebase origin/main
+          done
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # ADR-0572: the XCFramework's five per-target static libraries build in
+  # parallel, each leg checking out the pushed bump commit — the tree every
+  # release artifact descends from — so the libraries are correct by
+  # construction; the stamp job's later commit only adds Package.swift,
+  # which is not compiled into the libraries.
+  xcframework:
+    name: XCFramework (${{ matrix.target }})
+    needs: [release-owner, version]
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin, aarch64-apple-ios, aarch64-apple-ios-sim, x86_64-apple-ios]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+
+      # Shared Rust preamble (sccache + rust-cache; the preamble's
+      # internal dtolnay@rev is the rust-toolchain.toml sync point, and
+      # toolchain-targets carries this leg's target). These
+      # compile-dominated lanes run sccache on macOS too — the release
+      # poles — where a rust-cache restore alone is mtime-invalidated on
+      # a fresh checkout (ADR-0331; docs/testing/build-caches.md,
+      # "Release workflow lanes").
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          sccache: "true"
+          free-disk: "false"
+          mold: "false"
+          toolchain-targets: ${{ matrix.target }}
+
+      # --build-target: the one build entry's per-target mode — the
+      # script owns the deployment-target envs and the lib path, so the
+      # legs never hand-roll a cargo invocation. The printed path is the
+      # layout contract (lib_for's derivation); the upload consumes it
+      # instead of re-spelling the path.
+      - name: Build the static library
+        id: build
+        run: |
+          lib="$(bash scripts/build-xcframework.sh --build-target ${{ matrix.target }})"
+          echo "lib=$lib" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xcframework-${{ matrix.target }}
+          path: ${{ steps.build.outputs.lib }}
+
+  # ADR-0572: the second release commit. Assembles the XCFramework from
+  # the xcframework legs' libraries (built from the bump commit's tree by
+  # construction), computes the zip's checksum, stamps Package.swift, and
+  # pushes the stamp commit on top of the bump commit — under the same
+  # fetch + rebase + REBUILD retry the bump used to carry: a rebase that
+  # changes the tree rebuilds from the rebased tree, never reusing
+  # libraries built from the pre-rebase one (ADR-0433 §6's contract: the
+  # tagged commit's Package.swift checksum pins a zip built from that
+  # exact tree). A rebase conflict fails loudly (the release stays
+  # untagged). Every artifact job and the tag build from this job's
+  # output sha, so the tagged tree and the built tree cannot diverge.
+  swift-stamp:
+    name: Stamp Swift package
+    needs: [release-owner, version, xcframework]
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+
+      # The xcframework legs' libraries. Only those five artifacts exist
+      # in the run at this point; the staging loop below copies exactly
+      # the five it names.
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+
+      # Shared Rust preamble (sccache + rust-cache, all five Apple
+      # targets): the common path only assembles, but the rebase-retry
+      # path below rebuilds every target from scratch, and it must find
+      # the toolchain and the compile cache ready.
+      - uses: ./.github/actions/setup-rust-ci
+        with:
+          sccache: "true"
+          free-disk: "false"
+          mold: "false"
+          toolchain-targets: aarch64-apple-darwin,x86_64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios
+
+      - name: Assemble, stamp, commit and push
+        id: commit
+        env:
+          RELEASE_TAG: ${{ needs.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          git config user.name "release-bot"
+          git config user.email "actions@github.com"
+          # Stage the xcframework legs' libraries into lib_for's layout —
+          # the profile flows through the same env the build entry reads.
+          # Loud on a missing or empty library — never a silent partial
+          # build.
+          profile="${XCFRAMEWORK_CARGO_PROFILE:-release}"
+          for t in aarch64-apple-darwin x86_64-apple-darwin aarch64-apple-ios \
+                   aarch64-apple-ios-sim x86_64-apple-ios; do
+            mkdir -p "target/$t/$profile"
+            cp "staging/xcframework-$t/librelate_ffi.a" "target/$t/$profile/librelate_ffi.a"
+            test -s "target/$t/$profile/librelate_ffi.a"
+          done
           committed=0
           for attempt in 1 2 3; do
-            bash scripts/build-xcframework.sh --zip
-            bash scripts/stamp-swift-package.sh "${{ steps.version.outputs.tag }}" \
+            if [ "$attempt" = 1 ]; then
+              # The staged libraries were built from this exact tree;
+              # assemble from them.
+              bash scripts/build-xcframework.sh --assemble-only --zip
+            else
+              # A rebase changed the tree: the staged libraries are
+              # stale. Rebuild everything from the rebased tree.
+              bash scripts/build-xcframework.sh --zip
+            fi
+            bash scripts/stamp-swift-package.sh "$RELEASE_TAG" \
               target/apple/RelateFFI.xcframework.zip
-            # scripts/release-bump.sh is the single source of truth for
-            # which files a bump touches; stage whatever it modified so a
-            # new version surface can never be left out of the commit.
             git add -u
-            # The bump script is idempotent: a re-dispatch after a
-            # fail-before-tag can produce an empty diff; skip the commit but
-            # still emit HEAD. After a rejected push the rebase already
-            # carries the bump commit, so a re-stamp's diff (the rebuilt
-            # zip's checksum) folds into it with --amend — never stacked as
-            # a second "chore(release): <tag>" commit (observed on the
-            # v0.1.1 run: the tag's chain carried two of them).
+            # Re-dispatch after a fail-before-tag may find the stamp
+            # commit already on main: a byte-identical re-assembly
+            # produces an empty diff, so skip the commit but still emit
+            # HEAD. After a rejected push the rebase already carries the
+            # stamp commit, so a re-stamp's diff (the rebuilt zip's
+            # checksum) folds into it with --amend — never stacked as a
+            # second stamp commit within one run.
             if git diff --cached --quiet; then
-              echo "No version changes to commit; reusing HEAD."
+              echo "No stamp changes to commit; reusing HEAD."
             elif [ "$committed" = 1 ]; then
               git commit --amend --no-edit
             else
-              git commit -m "chore(release): ${{ steps.version.outputs.tag }}"
+              git commit -m "chore(release): $RELEASE_TAG swift package"
               committed=1
             fi
             if git push origin HEAD:main; then
@@ -188,7 +327,7 @@ jobs:
 
   cli:
     name: CLI (${{ matrix.target }})
-    needs: [release-owner, version]
+    needs: [release-owner, swift-stamp]
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -215,18 +354,27 @@ jobs:
             exit 1
           fi
           dpkg-query -W -f='ca-certificates ${Version}' ca-certificates
-      # Build from the versioned commit so artifacts carry the release version.
+      # Build from the stamped release commit (ADR-0572) — the one tree
+      # every artifact and the tag share — so artifacts carry the release
+      # version.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.sha }}
+          ref: ${{ needs.swift-stamp.outputs.sha }}
 
-      # Keep @rev in sync with rust-toolchain.toml (channel = "1.88.0"):
-      # the action installs the toolchain named by @rev, including any
-      # components/targets; @stable would put them on a toolchain nothing
-      # uses because cargo resolves rust-toolchain.toml instead.
-      - uses: dtolnay/rust-toolchain@1.88.0
+      # Shared Rust preamble (sccache + rust-cache; the preamble's
+      # internal dtolnay@rev is the rust-toolchain.toml sync point, and
+      # toolchain-targets carries this leg's target). Every leg
+      # cold-compiled the full dependency tree per release before this;
+      # sccache makes those compiles content-addressed hits on the
+      # macOS/Windows legs too — the release poles — where a rust-cache
+      # restore alone is mtime-invalidated on a fresh checkout
+      # (ADR-0331; docs/testing/build-caches.md, "Release workflow
+      # lanes"). free-disk and mold stay at their defaults (Linux-only
+      # effects inside the action).
+      - uses: ./.github/actions/setup-rust-ci
         with:
-          targets: ${{ matrix.target }}
+          sccache: "true"
+          toolchain-targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools (Linux ARM64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -269,7 +417,7 @@ jobs:
 
   ffi:
     name: FFI (${{ matrix.target }})
-    needs: [release-owner, version]
+    needs: [release-owner, swift-stamp]
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -296,18 +444,27 @@ jobs:
             exit 1
           fi
           dpkg-query -W -f='ca-certificates ${Version}' ca-certificates
-      # Build from the versioned commit so artifacts carry the release version.
+      # Build from the stamped release commit (ADR-0572) — the one tree
+      # every artifact and the tag share — so artifacts carry the release
+      # version.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.sha }}
+          ref: ${{ needs.swift-stamp.outputs.sha }}
 
-      # Keep @rev in sync with rust-toolchain.toml (channel = "1.88.0"):
-      # the action installs the toolchain named by @rev, including any
-      # components/targets; @stable would put them on a toolchain nothing
-      # uses because cargo resolves rust-toolchain.toml instead.
-      - uses: dtolnay/rust-toolchain@1.88.0
+      # Shared Rust preamble (sccache + rust-cache; the preamble's
+      # internal dtolnay@rev is the rust-toolchain.toml sync point, and
+      # toolchain-targets carries this leg's target). Every leg
+      # cold-compiled the full dependency tree per release before this;
+      # sccache makes those compiles content-addressed hits on the
+      # macOS/Windows legs too — the release poles — where a rust-cache
+      # restore alone is mtime-invalidated on a fresh checkout
+      # (ADR-0331; docs/testing/build-caches.md, "Release workflow
+      # lanes"). free-disk and mold stay at their defaults (Linux-only
+      # effects inside the action).
+      - uses: ./.github/actions/setup-rust-ci
         with:
-          targets: ${{ matrix.target }}
+          sccache: "true"
+          toolchain-targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools (Linux ARM64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -372,7 +529,7 @@ jobs:
   # module is `relate`).
   python:
     name: PyPI wheels (relate-db, ${{ matrix.target }})
-    needs: [release-owner, version]
+    needs: [release-owner, swift-stamp]
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
@@ -399,15 +556,21 @@ jobs:
             exit 1
           fi
           dpkg-query -W -f='ca-certificates ${Version}' ca-certificates
-      # Build from the versioned commit so artifacts carry the release version.
+      # Build from the stamped release commit (ADR-0572) — the one tree
+      # every artifact and the tag share — so artifacts carry the release
+      # version.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.sha }}
+          ref: ${{ needs.swift-stamp.outputs.sha }}
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
+      # sccache through the action's own input rather than the shared
+      # preamble: the linux legs build inside manylinux containers a
+      # host-side RUSTC_WRAPPER never reaches, and the action wires the
+      # GHA backend through for the native (macOS/Windows) legs too.
       - name: Build wheels
         uses: PyO3/maturin-action@v1
         with:
@@ -415,6 +578,7 @@ jobs:
           target: ${{ matrix.target }}
           args: --release --out dist ${{ matrix.extra }}
           manylinux: auto
+          sccache: true
 
       - uses: actions/upload-artifact@v4
         with:
@@ -429,7 +593,7 @@ jobs:
   # target toolchain, so every leg runs on ubuntu-latest.
   java:
     name: Java client jars (fat + the five platform classifiers, ADR-0490)
-    needs: [release-owner, version, ffi]
+    needs: [release-owner, swift-stamp, ffi]
     runs-on: ubuntu-latest
     steps:
       - name: Patch CVE-2026-111943 (eMudhra CA compromise)
@@ -441,12 +605,12 @@ jobs:
             echo "::error::eMudhra root still trusted after CA rebuild (CVE-2026-111943)"
             exit 1
           fi
-      # Package from the versioned commit so the jars carry the release
-      # version stamped by scripts/release-bump.sh (the pom is a sweep
-      # surface).
+      # Package from the stamped release commit (ADR-0572) so the jars
+      # carry the release version stamped by scripts/release-bump.sh
+      # (the pom is a sweep surface).
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.sha }}
+          ref: ${{ needs.swift-stamp.outputs.sha }}
 
       - uses: actions/setup-java@v5
         with:
@@ -505,7 +669,7 @@ jobs:
 
   npm-platform:
     name: npm platform package (${{ matrix.npm_name }})
-    needs: [release-owner, version, ffi]
+    needs: [release-owner, swift-stamp, ffi]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -532,11 +696,11 @@ jobs:
             exit 1
           fi
           dpkg-query -W -f='ca-certificates ${Version}' ca-certificates
-      # Pack from the versioned commit so the manifest carries the release
-      # version stamped by scripts/release-bump.sh.
+      # Pack from the stamped release commit (ADR-0572) so the manifest
+      # carries the release version stamped by scripts/release-bump.sh.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.sha }}
+          ref: ${{ needs.swift-stamp.outputs.sha }}
 
       - uses: actions/setup-node@v4
         with:
@@ -568,10 +732,11 @@ jobs:
 
   # Build and pack @relate/relate-wasm (ADR-0278). build-wasm.sh
   # stamps pkg/package.json from the workspace Cargo.toml, so checking out
-  # the versioned commit makes the package version equal the release tag.
+  # the stamped release commit makes the package version equal the
+  # release tag.
   npm-wasm:
     name: npm wasm package
-    needs: [release-owner, version]
+    needs: [release-owner, swift-stamp]
     runs-on: ubuntu-latest
     steps:
       - name: Patch CVE-2026-111943 (eMudhra CA compromise)
@@ -592,7 +757,7 @@ jobs:
           dpkg-query -W -f='ca-certificates ${Version}' ca-certificates
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.sha }}
+          ref: ${{ needs.swift-stamp.outputs.sha }}
 
       # Keep @rev in sync with rust-toolchain.toml (channel = "1.88.0"):
       # the action installs the toolchain named by @rev, including any
@@ -629,10 +794,10 @@ jobs:
 
   # Pack @relate/relate (pure JS; the five platform packages are its
   # optionalDependencies, so the manifest's pins must already carry the
-  # release version — they do, from the versioned commit).
+  # release version — they do, from the stamped release commit).
   npm-main:
     name: npm main package
-    needs: [release-owner, version]
+    needs: [release-owner, swift-stamp]
     runs-on: ubuntu-latest
     steps:
       - name: Patch CVE-2026-111943 (eMudhra CA compromise)
@@ -653,7 +818,7 @@ jobs:
           dpkg-query -W -f='ca-certificates ${Version}' ca-certificates
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.sha }}
+          ref: ${{ needs.swift-stamp.outputs.sha }}
 
       - uses: actions/setup-node@v4
         with:
@@ -675,7 +840,7 @@ jobs:
     # published tag pointing at a release commit. The npm pack jobs are part
     # of the invariant: a broken npm package blocks the tag like every other
     # artifact, so the published npm version always equals the tag.
-    needs: [version, cli, ffi, python, java, npm-platform, npm-wasm, npm-main]
+    needs: [version, swift-stamp, cli, ffi, python, java, npm-platform, npm-wasm, npm-main]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -698,7 +863,7 @@ jobs:
           dpkg-query -W -f='ca-certificates ${Version}' ca-certificates
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.sha }}
+          ref: ${{ needs.swift-stamp.outputs.sha }}
 
       - name: Create and push annotated tag
         run: |
@@ -714,7 +879,11 @@ jobs:
   # pushes it. Offline releases skip both: ECR is outside GitHub.
   build-image:
     name: Build server image
-    needs: [version, tag]
+    # swift-stamp for the ref (ADR-0572): the image is built from the
+    # stamped release commit — the one tree the tag points at and every
+    # artifact shares; the bump commit differs from it only by
+    # Package.swift, but one tree is the rule.
+    needs: [version, swift-stamp, tag]
     if: ${{ !inputs.offline }}
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -739,7 +908,7 @@ jobs:
           dpkg-query -W -f='ca-certificates ${Version}' ca-certificates
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.sha }}
+          ref: ${{ needs.swift-stamp.outputs.sha }}
 
       # docker_smoke.py connects to the running container over Bolt with the
       # official Python driver, so a broken entrypoint, binary or auth setup
@@ -1055,7 +1224,7 @@ jobs:
   # host; the ffi linux-x64 artifact provides the RELATE_LIB fallback.
   npm-smoke-gate:
     name: npm smoke gate
-    needs: [version, npm-platform, npm-wasm, npm-main]
+    needs: [version, swift-stamp, npm-platform, npm-wasm, npm-main]
     runs-on: ubuntu-latest
     steps:
       - name: Patch CVE-2026-111943 (eMudhra CA compromise)
@@ -1076,7 +1245,7 @@ jobs:
           dpkg-query -W -f='ca-certificates ${Version}' ca-certificates
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.sha }}
+          ref: ${{ needs.swift-stamp.outputs.sha }}
 
       - uses: actions/setup-node@v4
         with:
@@ -1185,7 +1354,7 @@ jobs:
   # logs a skip and the release stays green.
   publish-releases-json:
     name: Publish releases.json + notify relate-web
-    needs: [version, create-release, release-notes]
+    needs: [version, swift-stamp, create-release, release-notes]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1204,11 +1373,11 @@ jobs:
             echo "::error::eMudhra root still trusted after CA rebuild (CVE-2026-111943)"
             exit 1
           fi
-      # The generator at the versioned commit (the release publishes with
-      # the script it shipped with); distribution carries install.sh.
+      # The generator at the stamped release commit (the release publishes
+      # with the script it shipped with); distribution carries install.sh.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.sha }}
+          ref: ${{ needs.swift-stamp.outputs.sha }}
           sparse-checkout: |
             .github/scripts
             distribution
@@ -1278,7 +1447,7 @@ jobs:
   # website path, which an offline release deliberately does not touch.
   self-update-smoke:
     name: Self-update smoke
-    needs: [version, create-release]
+    needs: [version, swift-stamp, create-release]
     if: ${{ !inputs.offline }}
     runs-on: ubuntu-latest
     permissions:
@@ -1300,14 +1469,14 @@ jobs:
             exit 1
           fi
           dpkg-query -W -f='ca-certificates ${Version}' ca-certificates
-      # The smoke script at the versioned commit (the release verifies the
-      # script it shipped with), plus scripts/lib: the script
+      # The smoke script at the stamped release commit (the release
+      # verifies the script it shipped with), plus scripts/lib: the script
       # unconditionally sources the shared TOML reader for the
       # EXPECTED_VERSION default.
       - name: Checkout the smoke script (sparse)
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.sha }}
+          ref: ${{ needs.swift-stamp.outputs.sha }}
           sparse-checkout: |
             .github/scripts
             scripts/lib
@@ -1347,7 +1516,7 @@ jobs:
   # release-notes dispatch can post for the same tag.
   slack-announce:
     name: Announce release on Slack
-    needs: [version, release-notes, publish-releases-json, self-update-smoke]
+    needs: [version, swift-stamp, release-notes, publish-releases-json, self-update-smoke]
     if: ${{ !inputs.offline }}
     runs-on: ubuntu-latest
     # The announce leg is a CA patch, a sparse checkout, one artifact
@@ -1376,13 +1545,14 @@ jobs:
             exit 1
           fi
           dpkg-query -W -f='ca-certificates ${Version}' ca-certificates
-      # The Slack policy script at the versioned commit — the release
-      # announces with the script it shipped with (the self-update-smoke
-      # precedent). Sparse checkout: release-notes-slack.sh is self-contained.
+      # The Slack policy script at the stamped release commit — the
+      # release announces with the script it shipped with (the
+      # self-update-smoke precedent). Sparse checkout:
+      # release-notes-slack.sh is self-contained.
       - name: Checkout the Slack policy script (sparse)
         uses: actions/checkout@v4
         with:
-          ref: ${{ needs.version.outputs.sha }}
+          ref: ${{ needs.swift-stamp.outputs.sha }}
           sparse-checkout: |
             .github/scripts
       # The payload artifact the release-notes run uploaded instead of
